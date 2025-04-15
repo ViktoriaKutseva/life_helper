@@ -1,13 +1,15 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from dotenv import load_dotenv
-import os
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Access variables
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+class EnvVars(BaseSettings):
+    TELEGRAM_BOT_TOKEN: str
+    DB_URL: str  
 
-# Ensure the token exists
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN is missing from .env file")
+    model_config = SettingsConfigDict(env_file='.env', extra="ignore")
+
+# Function to get environment variables
+def get_env_vars() -> EnvVars:
+    return EnvVars()
