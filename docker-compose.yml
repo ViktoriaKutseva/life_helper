@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: life_helper_bot
+    environment:
+      - TELEGRAM_BOT_TOKEN
+      - DB_URL
+      - ADMIN_CHAT_ID
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped 
