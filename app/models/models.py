@@ -14,6 +14,7 @@ class User(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     telegram_id = Column(Integer, unique=True, nullable=False)
+    last_notified = Column(DateTime, nullable=True)  # Track when the user was last notified
 
     tasks = relationship("Task", back_populates="user")
 
@@ -26,6 +27,8 @@ class Task(Base):
     completed = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     frequency = Column(sqlalchemy.Enum(Frequency), nullable=False)
+    days_of_week = Column(String, nullable=True)
+    last_completed = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="tasks")
     

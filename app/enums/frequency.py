@@ -5,3 +5,4 @@ class Frequency(Enum):
     EVERYDAY = 1
     WEEKLY = 7
     MONTHLY = 30 
+    SPECIFIC_DAYS = 8 

@@ -6,7 +6,8 @@ load_dotenv()
 
 class EnvVars(BaseSettings):
     TELEGRAM_BOT_TOKEN: str
-    DB_URL: str  
+    DB_URL: str
+    ADMIN_CHAT_ID: str = ""  # Optional admin chat ID for startup notification
 
     model_config = SettingsConfigDict(env_file='.env', extra="ignore")
 
