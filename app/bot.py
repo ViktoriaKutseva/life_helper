@@ -13,7 +13,7 @@ from database.database import engine, SessionLocal
 from services.crud import (
     create_user, get_user_by_telegram_id, create_task, get_tasks_by_user,
     get_all_users, get_tasks_due_today, complete_task, reset_recurring_tasks,
-    update_user_last_notified
+    update_user_last_notified, delete_task
 )
 from config import get_env_vars
 from models.models import User, Task
@@ -45,6 +45,7 @@ class TgBotClient:
         application.add_handler(CommandHandler("list_task", self.show_all_tasks))
         application.add_handler(CommandHandler("today_tasks", self.today_tasks_command))
         application.add_handler(CommandHandler("done", self.done_command))
+        application.add_handler(CommandHandler("delete", self.delete_command))
 
 
     async def post_init(self, application: Application) -> None:
@@ -53,7 +54,8 @@ class TgBotClient:
             BotCommand("add_task", "Добавить задачу"),
             BotCommand("list_task", "Показать все задачи"),
             BotCommand("today_tasks", "Задачи на сегодня"),
-            BotCommand("done", "Отметить задачу как выполненную: /done <ID задачи>")
+            BotCommand("done", "Отметить задачу как выполненную: /done <ID задачи>"),
+            BotCommand("delete", "Удалить задачу: /delete <ID задачи>")
         ])
         
         # Get admin chat ID from environment variables
@@ -219,6 +221,52 @@ class TgBotClient:
                     pass
                 db.close()
                 return
+        
+        # Check if this is a task deletion button
+        if callback_data.startswith("delete_"):
+            try:
+                task_id = int(callback_data.split("_")[1])
+                
+                # Verify task belongs to user
+                task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
+                
+                if not task:
+                    await query.edit_message_text("Задача не найдена или не принадлежит вам.")
+                    db.close()
+                    return
+                
+                # Remember task name before deletion
+                task_title = task.title
+                
+                # Delete the task
+                delete_task(db, task_id)
+                
+                # Update the message to reflect the change
+                user_tasks = get_tasks_by_user(db, user.id)
+                
+                if user_tasks:
+                    new_message, new_markup = await self._format_task_list(user_tasks, "📌 Ваши задачи:", with_buttons=True)
+                    await query.edit_message_text(new_message, reply_markup=new_markup)
+                else:
+                    # No tasks left
+                    await query.edit_message_text("📌 Ваши задачи:\n📭 Задач нет.")
+                
+                # Send a separate confirmation message
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=f"🗑️ Задача #{task_id}: '{task_title}' удалена!"
+                )
+                
+                db.close()
+                return
+            except Exception as e:
+                logger.error(f"Error in task deletion button handler: {e}")
+                try:
+                    await query.edit_message_text("⚠️ Произошла ошибка при удалении задачи.")
+                except Exception:
+                    pass
+                db.close()
+                return
 
         task_name = context.user_data.get("task_name")
         selected_days = context.user_data.get("selected_days", set()) # Ensure selected_days exists
@@ -352,9 +400,19 @@ class TgBotClient:
             status = '✅' if task.completed else '❌'
             
             # Only show completion button for incomplete tasks
-            if not task.completed and with_buttons:
-                button = InlineKeyboardButton(f"✅ #{task_id}", callback_data=f"complete_{task_id}")
-                buttons.append([button])
+            if with_buttons:
+                # For incomplete tasks, show complete button
+                if not task.completed:
+                    button_row = []
+                    complete_button = InlineKeyboardButton(f"✅ #{task_id}", callback_data=f"complete_{task_id}")
+                    delete_button = InlineKeyboardButton(f"🗑️ #{task_id}", callback_data=f"delete_{task_id}")
+                    button_row.append(complete_button)
+                    button_row.append(delete_button)
+                    buttons.append(button_row)
+                # For completed tasks, only show delete button
+                else:
+                    delete_button = InlineKeyboardButton(f"🗑️ #{task_id}", callback_data=f"delete_{task_id}")
+                    buttons.append([delete_button])
             
             task_lines.append(f"🔹 #{task_id}: {task.title} ({freq_str}) {status}")
         
@@ -620,6 +678,54 @@ class TgBotClient:
         finally:
             db.close()
             logger.info("Task reset job finished.")
+
+    async def delete_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Delete a task using task ID: /delete <task_id>"""
+        if not context.args:
+            await update.message.reply_text(
+                "Пожалуйста, укажите ID задачи после /delete.\n"
+                "Например: /delete 5\n"
+                "Чтобы увидеть ID задач, используйте /list_task"
+            )
+            return
+            
+        try:
+            task_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("ID задачи должен быть числом. Например: /delete 5")
+            return
+            
+        db = SessionLocal()
+        try:
+            # Get the user
+            user = get_user_by_telegram_id(db, update.effective_user.id)
+            if not user:
+                await update.message.reply_text("Вы не зарегистрированы. Используйте /start.")
+                return
+                
+            # Find the task and verify it belongs to the user
+            task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
+            
+            if not task:
+                await update.message.reply_text(f"Задача #{task_id} не найдена или не принадлежит вам.")
+                return
+                
+            # Remember task title before deletion
+            task_title = task.title
+                
+            # Delete the task
+            success = delete_task(db, task_id)
+            
+            if success:
+                await update.message.reply_text(f"🗑️ Задача #{task_id}: '{task_title}' удалена!")
+            else:
+                await update.message.reply_text(f"⚠️ Не удалось удалить задачу #{task_id}.")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при удалении задачи: {e}")
+            await update.message.reply_text("⚠️ Произошла ошибка. Пожалуйста, попробуйте еще раз.")
+        finally:
+            db.close()
 
     def run(self):
         logger.info("Starting bot")
