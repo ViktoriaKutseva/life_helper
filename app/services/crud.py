@@ -33,7 +33,14 @@ def create_task(db: Session, user_id: int, title: str, frequency: Frequency, day
 
 # 🟢 GET Tasks by User
 def get_tasks_by_user(db: Session, user_id: int):
-    return db.query(Task).filter(Task.user_id == user_id).all()
+    """Returns all tasks for a user with completion status for today."""
+    tasks = db.query(Task).filter(Task.user_id == user_id).all()
+    
+    # Check each task's completion status for today
+    for task in tasks:
+        task.completed = is_task_completed_today(db, task)
+    
+    return tasks
 
 # 🟢 GET Tasks Due Today by User
 def get_tasks_due_today(db: Session, user_id: int):

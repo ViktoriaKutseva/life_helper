@@ -13,7 +13,7 @@ from database.database import engine, SessionLocal
 from services.crud import (
     create_user, get_user_by_telegram_id, create_task, get_tasks_by_user,
     get_all_users, get_tasks_due_today, complete_task, reset_recurring_tasks,
-    update_user_last_notified, delete_task, schedule_yearly_cleanup
+    update_user_last_notified, delete_task, schedule_yearly_cleanup, is_task_completed_today
 )
 from config import get_env_vars
 from models.models import User, Task
@@ -190,14 +190,17 @@ class TgBotClient:
                     db.close()
                     return
                     
-                # Check if already completed
-                if task.completed:
-                    await query.edit_message_text("Эта задача уже отмечена как выполненная. Обновите список командой /list_task")
+                # Check if already completed today
+                if is_task_completed_today(db, task):
+                    await query.edit_message_text("Эта задача уже отмечена как выполненная сегодня. Обновите список командой /list_task")
                     db.close()
                     return
                     
                 # Mark as completed
                 task = complete_task(db, task_id)
+                
+                # Set the task as completed (for display purposes) - this gets overridden by get_tasks_by_user later
+                task.completed = True
                 
                 # Update the message to reflect the change
                 user_tasks = get_tasks_by_user(db, user.id)
@@ -668,9 +671,9 @@ class TgBotClient:
                 await update.message.reply_text(f"Задача #{task_id} не найдена или не принадлежит вам.")
                 return
                 
-            # Check if already completed
-            if task.completed:
-                await update.message.reply_text(f"Задача #{task_id} уже отмечена как выполненная.")
+            # Check if already completed today
+            if is_task_completed_today(db, task):
+                await update.message.reply_text(f"Задача #{task_id} уже отмечена как выполненная сегодня.")
                 return
                 
             # Mark as completed
