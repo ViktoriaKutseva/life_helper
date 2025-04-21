@@ -31,4 +31,14 @@ class Task(Base):
     last_completed = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="tasks")
+    completions = relationship("TaskCompletion", back_populates="task", cascade="all, delete-orphan")
+
+class TaskCompletion(Base):
+    __tablename__ = "task_completions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    completed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    
+    task = relationship("Task", back_populates="completions")
     

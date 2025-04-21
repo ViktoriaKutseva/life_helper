@@ -13,7 +13,7 @@ from database.database import engine, SessionLocal
 from services.crud import (
     create_user, get_user_by_telegram_id, create_task, get_tasks_by_user,
     get_all_users, get_tasks_due_today, complete_task, reset_recurring_tasks,
-    update_user_last_notified, delete_task
+    update_user_last_notified, delete_task, schedule_yearly_cleanup
 )
 from config import get_env_vars
 from models.models import User, Task
@@ -76,14 +76,14 @@ class TgBotClient:
         job_queue = application.job_queue
         
         # Set the time to specified Almaty time 
-        target_time = time(17, 11, 0, tzinfo=timezone('Asia/Almaty'))
+        target_time = time(9, 0, 0, tzinfo=timezone('Asia/Almaty'))
         job_queue.run_daily(self.send_daily_reminders, target_time)
         logger.info(f"Scheduled daily reminders for {target_time} (Almaty time)")
         
-        # Schedule daily reset at midnight
-        midnight = time(0, 0, 0, tzinfo=timezone('Asia/Almaty'))
-        job_queue.run_daily(self.reset_tasks_job, midnight)
-        logger.info(f"Scheduled daily task reset for {midnight} (Almaty time)")
+        # Schedule yearly cleanup on the first day of each month
+        first_day_midnight = time(0, 0, 0, tzinfo=timezone('Asia/Almaty'))
+        job_queue.run_monthly(self.yearly_cleanup_job, first_day_midnight, 1)
+        logger.info(f"Scheduled yearly cleanup on first day of each month at {first_day_midnight} (Almaty time)")
         
         # Schedule backup notifications every 6 hours
         job_queue.run_repeating(
@@ -726,6 +726,37 @@ class TgBotClient:
             await update.message.reply_text("⚠️ Произошла ошибка. Пожалуйста, попробуйте еще раз.")
         finally:
             db.close()
+
+    async def yearly_cleanup_job(self, context: CallbackContext) -> None:
+        """Run yearly cleanup to remove old task completion records.
+        This is scheduled to run monthly but only performs cleanup 
+        on January 1st to avoid excessive DB operations.
+        """
+        today = datetime.now(timezone('Asia/Almaty'))
+        
+        # Only do cleanup on January 1st
+        if today.month == 1 and today.day == 1:
+            logger.info("Running yearly task completion history cleanup...")
+            db = SessionLocal()
+            try:
+                deleted_count = schedule_yearly_cleanup(db)
+                logger.info(f"Deleted {deleted_count} old task completion records.")
+                
+                # Notify admin if configured
+                env_vars = get_env_vars()
+                admin_chat_id = env_vars.ADMIN_CHAT_ID
+                if admin_chat_id:
+                    await context.bot.send_message(
+                        chat_id=admin_chat_id,
+                        text=f"✅ Yearly cleanup complete: removed {deleted_count} old task completion records."
+                    )
+            except Exception as e:
+                logger.error(f"Error during yearly cleanup: {e}")
+            finally:
+                db.close()
+                logger.info("Yearly cleanup job finished.")
+        else:
+            logger.info(f"Monthly check for yearly cleanup - skipping (not January 1st)")
 
     def run(self):
         logger.info("Starting bot")

@@ -1,9 +1,9 @@
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_, cast, Integer, func, extract
-from models.models import User, Task
+from sqlalchemy import or_, and_, cast, Integer, func, extract, desc
+from models.models import User, Task, TaskCompletion
 from enums.frequency import Frequency
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime, timedelta, date
+from typing import Optional, List
 
 
 # 🟢 CREATE User
@@ -37,18 +37,24 @@ def get_tasks_by_user(db: Session, user_id: int):
 
 # 🟢 GET Tasks Due Today by User
 def get_tasks_due_today(db: Session, user_id: int):
-    """Returns a list of tasks for the user that are due today."""
+    """Returns a list of tasks for the user that are due today.
+    Includes completion status for today.
+    """
     today = datetime.utcnow() # Use UTC consistently
     today_weekday_abbr = today.strftime('%a').upper() # e.g., MON, TUE
     today_day_of_month = today.day # e.g., 15
     today_weekday_num = today.weekday() # Monday is 0 and Sunday is 6
     
+    # For SQLite compatibility, use strftime instead of extract
+    # SQLite strftime('%w',...) returns 0 for Sunday, 1-6 for Mon-Sat
+    # Python weekday() returns 0 for Monday, 6 for Sunday
+    # So we need to do: (weekday_num + 1) % 7 to compare with strftime('%w')
+    
     adjusted_weekday = (today_weekday_num + 1) % 7
 
     # SQLAlchemy query with SQLite-compatible date functions
-    return db.query(Task).filter(
+    tasks = db.query(Task).filter(
         Task.user_id == user_id,
-        Task.completed == False,
         or_(
             Task.frequency == Frequency.EVERYDAY,
             and_(
@@ -68,16 +74,71 @@ def get_tasks_due_today(db: Session, user_id: int):
             )
         )
     ).all()
+    
+    # For each task, check if it was completed today
+    for task in tasks:
+        task.completed = is_task_completed_today(db, task)
+    
+    return tasks
 
 # 🟢 UPDATE Task (Mark as Completed)
 def complete_task(db: Session, task_id: int):
-    db_task = db.query(Task).filter(Task.id == task_id).first()
-    if db_task:
-        db_task.completed = True
-        db_task.last_completed = datetime.utcnow()  # Record completion time
+    """Mark a task as completed by creating a completion record"""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task:
+        # Create a new completion record
+        completion = TaskCompletion(
+            task_id=task.id, 
+            completed_at=datetime.utcnow()
+        )
+        db.add(completion)
+        
+        # Update the last_completed timestamp on the task itself
+        task.last_completed = completion.completed_at
+        
         db.commit()
-        db.refresh(db_task)
-    return db_task
+        db.refresh(task)
+    return task
+
+def get_task_completion_for_day(db: Session, task_id: int, target_date: datetime = None):
+    """Check if a task was completed on a specific day"""
+    if target_date is None:
+        target_date = datetime.utcnow()
+    
+    # Convert to date only for comparison
+    target_day = target_date.date()
+    
+    # Find any completion records for this task on the target day
+    completion = (db.query(TaskCompletion)
+                  .filter(TaskCompletion.task_id == task_id)
+                  .filter(func.date(TaskCompletion.completed_at) == target_day)
+                  .order_by(desc(TaskCompletion.completed_at))
+                  .first())
+    
+    return completion
+
+def is_task_completed_today(db: Session, task: Task):
+    """Check if a task is completed today"""
+    return get_task_completion_for_day(db, task.id) is not None
+
+def get_task_completions(db: Session, task_id: int, limit: int = 30):
+    """Get the recent completion history for a task"""
+    return (db.query(TaskCompletion)
+            .filter(TaskCompletion.task_id == task_id)
+            .order_by(desc(TaskCompletion.completed_at))
+            .limit(limit)
+            .all())
+
+def delete_old_completions(db: Session, days_to_keep: int = 365):
+    """Delete completion records older than the specified number of days"""
+    cutoff_date = datetime.utcnow() - timedelta(days=days_to_keep)
+    
+    result = db.query(TaskCompletion).filter(
+        TaskCompletion.completed_at < cutoff_date
+    ).delete()
+    
+    db.commit()
+    return result
 
 # 🟢 Reset Recurring Tasks
 def reset_recurring_tasks(db: Session):
@@ -157,4 +218,9 @@ def update_user_last_notified(db: Session, user_id: int):
         db.commit()
         db.refresh(user)
     return user
+
+def schedule_yearly_cleanup(db: Session):
+    """Schedule yearly cleanup - this should be called periodically"""
+    # Keep completion history for a year
+    return delete_old_completions(db, days_to_keep=365)
 
