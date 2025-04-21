@@ -203,7 +203,15 @@ class TgBotClient:
                 user_tasks = get_tasks_by_user(db, user.id)
                 new_message, new_markup = await self._format_task_list(user_tasks, "📌 Ваши задачи:", with_buttons=True)
                 
-                await query.edit_message_text(new_message, reply_markup=new_markup)
+                try:
+                    await query.edit_message_text(new_message, reply_markup=new_markup)
+                except Exception as e:
+                    # Handle the case where message content hasn't changed (common with new completion tracking)
+                    if "Message is not modified" in str(e):
+                        logger.info(f"Message wasn't modified when completing task #{task_id} - this is normal with completion tracking")
+                    else:
+                        # For other errors, log them but continue so we can at least send the confirmation
+                        logger.error(f"Error updating message after task completion: {e}")
                 
                 # Send a separate confirmation message to the user who completed the task
                 await context.bot.send_message(
@@ -246,10 +254,19 @@ class TgBotClient:
                 
                 if user_tasks:
                     new_message, new_markup = await self._format_task_list(user_tasks, "📌 Ваши задачи:", with_buttons=True)
-                    await query.edit_message_text(new_message, reply_markup=new_markup)
+                    try:
+                        await query.edit_message_text(new_message, reply_markup=new_markup)
+                    except Exception as e:
+                        if "Message is not modified" in str(e):
+                            logger.info(f"Message wasn't modified when deleting task #{task_id} - continuing anyway")
+                        else:
+                            logger.error(f"Error updating message after task deletion: {e}")
                 else:
                     # No tasks left
-                    await query.edit_message_text("📌 Ваши задачи:\n📭 Задач нет.")
+                    try:
+                        await query.edit_message_text("📌 Ваши задачи:\n📭 Задач нет.")
+                    except Exception as e:
+                        logger.error(f"Error updating message to show no tasks: {e}")
                 
                 # Send a separate confirmation message
                 await context.bot.send_message(
