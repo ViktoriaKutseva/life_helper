@@ -1,8 +1,8 @@
 from enum import Enum
 
 class Frequency(Enum):
-    ONCE = 0
-    EVERYDAY = 1
-    WEEKLY = 7
-    MONTHLY = 30 
-    SPECIFIC_DAYS = 8 
+    ONCE = "ONCE"
+    EVERYDAY = "EVERYDAY"
+    WEEKLY = "WEEKLY"
+    MONTHLY = "MONTHLY"
+    SPECIFIC_DAYS = "SPECIFIC_DAYS" 

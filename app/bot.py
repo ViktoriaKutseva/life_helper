@@ -47,6 +47,7 @@ class TgBotClient:
         application.add_handler(CommandHandler("today_tasks", self.today_tasks_command))
         application.add_handler(CommandHandler("done", self.done_command))
         application.add_handler(CommandHandler("delete", self.delete_command))
+        application.add_handler(CommandHandler("points", self.points_command))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_message_handler))
 
 
@@ -57,7 +58,8 @@ class TgBotClient:
             BotCommand("list_task", "Показать все задачи"),
             BotCommand("today_tasks", "Задачи на сегодня"),
             BotCommand("done", "Отметить задачу как выполненную: /done <ID задачи>"),
-            BotCommand("delete", "Удалить задачу: /delete <ID задачи>")
+            BotCommand("delete", "Удалить задачу: /delete <ID задачи>"),
+            BotCommand("points", "Показать общее количество баллов пользователя")
         ])
         
         # Get admin chat ID from environment variables
@@ -318,10 +320,8 @@ class TgBotClient:
                     logger.error(f"Invalid frequency string received: {frequency_str}")
                     await query.edit_message_text("An error occurred: invalid frequency.")
                     return
-
                 context.user_data["frequency_enum"] = frequency_enum
                 if frequency_enum == Frequency.SPECIFIC_DAYS:
-                    # Show day selection keyboard
                     selected_days = context.user_data.get("selected_days", set())
                     keyboard = self._build_day_selection_keyboard(selected_days)
                     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -331,7 +331,6 @@ class TgBotClient:
                     )
                     return
                 else:
-                    # For all other frequencies, ask for reminder time
                     await query.edit_message_text(
                         "Enter reminder time for the task (e.g., 09:30) or press 'Skip':",
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Skip", callback_data="skip_reminder_time")]])
@@ -342,38 +341,16 @@ class TgBotClient:
                 if not selected_days:
                     await query.answer("You didn't select any days!", show_alert=True)
                     return
-                # Sort days according to DAYS_OF_WEEK order before joining
                 days_str = ",".join(sorted(list(selected_days), key=DAYS_OF_WEEK.index))
                 context.user_data["days_of_week"] = days_str
-                # After days are selected, ask for reminder time
                 await query.edit_message_text(
                     "Enter reminder time for the task (e.g., 09:30) or press 'Skip':",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Skip", callback_data="skip_reminder_time")]])
                 )
                 return
             elif callback_data == "skip_reminder_time":
-                frequency_enum = context.user_data.get("frequency_enum")
-                task_name = context.user_data.get("task_name")
-                days_of_week = context.user_data.get("days_of_week")
-                task = create_task(
-                    db=db,
-                    user_id=user.id,
-                    title=task_name,
-                    frequency=frequency_enum,
-                    days_of_week=days_of_week
-                )
-                logger.info(f"Task created: id={task.id}, user_id={user.id}, telegram_id={user.telegram_id}, reminder_time={task.reminder_time}")
-                if task.reminder_time:
-                    context.application.job_queue.run_daily(
-                        self._make_task_reminder_callback(user.telegram_id, task.id),
-                        time=task.reminder_time
-                    )
-                    logger.info(f"Scheduled reminder for task {task.id} at {task.reminder_time} (telegram_id={user.telegram_id})")
-                await query.edit_message_text(f"✅ Task '{task_name}' with frequency '{frequency_enum.name}' added without reminder time!")
-                context.user_data.pop("task_name", None)
-                context.user_data.pop("frequency_enum", None)
-                context.user_data.pop("selected_days", None)
-                context.user_data.pop("days_of_week", None)
+                await query.edit_message_text("Введите количество баллов за выполнение этой задачи (целое число):")
+                context.user_data["awaiting_points"] = True
                 return
 
             elif callback_data.startswith("day_select_"):
@@ -451,6 +428,7 @@ class TgBotClient:
                 else:
                     reminder_str = f"⏰ {task.reminder_time.strftime('%H:%M')}"
             status = '✅' if task.completed else '❌'
+            points_str = f"🏅{task.points}" if hasattr(task, 'points') else ""
             
             if with_buttons:
                 if not task.completed:
@@ -465,7 +443,7 @@ class TgBotClient:
                     buttons.append([delete_button])
             
             # Включаем reminder_str в строку задачи
-            task_lines.append(f"🔹 #{task_id}: {task.title} ({freq_str}) {reminder_str} {status}".strip())
+            task_lines.append(f"🔹 #{task_id}: {task.title} ({freq_str}) {reminder_str} {points_str} {status}".strip())
         
         task_list = "\n".join(task_lines)
         message_text = f"{title_prefix}\n{task_list}"
@@ -851,44 +829,72 @@ class TgBotClient:
         self._bot.run_polling()
 
     async def text_message_handler(self, update: Update, context: CallbackContext) -> None:
+        if context.user_data.get("awaiting_points"):
+            points_text = update.message.text.strip()
+            try:
+                points = int(points_text)
+                if points < 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("Пожалуйста, введите неотрицательное целое число для баллов.")
+                return
+            frequency_enum = context.user_data.get("frequency_enum")
+            task_name = context.user_data.get("task_name")
+            days_of_week = context.user_data.get("days_of_week")
+            reminder_time = context.user_data.get("reminder_time") if "reminder_time" in context.user_data else None
+            db = SessionLocal()
+            try:
+                user = get_user_by_telegram_id(db, update.effective_user.id)
+                if not user:
+                    await update.message.reply_text("You are not registered. Use /start.")
+                    return
+                task = create_task(
+                    db=db,
+                    user_id=user.id,
+                    title=task_name,
+                    frequency=frequency_enum,
+                    days_of_week=days_of_week,
+                    reminder_time=reminder_time,
+                    points=points
+                )
+                logger.info(f"Task created: id={task.id}, user_id={user.id}, telegram_id={user.telegram_id}, points={points}")
+                await update.message.reply_text(f"✅ Задача '{task_name}' с баллами {points} добавлена!")
+            finally:
+                db.close()
+            context.user_data.pop("task_name", None)
+            context.user_data.pop("frequency_enum", None)
+            context.user_data.pop("selected_days", None)
+            context.user_data.pop("days_of_week", None)
+            context.user_data.pop("awaiting_points", None)
+            return
         if "frequency_enum" in context.user_data and "task_name" in context.user_data:
             time_text = update.message.text.strip()
             match = re.match(r"^(\d{1,2}):(\d{2})$", time_text)
             if match:
                 hour, minute = int(match.group(1)), int(match.group(2))
                 reminder_time = time(hour, minute)
-                frequency_enum = context.user_data.get("frequency_enum")
-                task_name = context.user_data.get("task_name")
-                db = SessionLocal()
-                try:
-                    user = get_user_by_telegram_id(db, update.effective_user.id)
-                    if not user:
-                        await update.message.reply_text("You are not registered. Use /start.")
-                        return
-                    task = create_task(
-                        db=db,
-                        user_id=user.id,
-                        title=task_name,
-                        frequency=frequency_enum,
-                        reminder_time=reminder_time
-                    )
-                    logger.info(f"Task created: id={task.id}, user_id={user.id}, telegram_id={user.telegram_id}, reminder_time={task.reminder_time}")
-                    # Schedule reminder immediately
-                    try:
-                        tz_reminder_time = reminder_time.replace(tzinfo=timezone('Asia/Yekaterinburg'))
-                        context.application.job_queue.run_daily(
-                            self._make_task_reminder_callback(user.telegram_id, task.id),
-                            time=tz_reminder_time
-                        )
-                        logger.info(f"Scheduled reminder for task {task.id} at {tz_reminder_time} (telegram_id={user.telegram_id})")
-                    except Exception as e:
-                        logger.error(f"[REMINDER_SCHEDULE_ERROR] Failed to schedule reminder for task {task.id}: {e}")
-                    await update.message.reply_text(f"✅ Task '{task_name}' with reminder at {reminder_time.strftime('%H:%M')} added!")
-                finally:
-                    db.close()
-                context.user_data.pop("task_name", None)
-                context.user_data.pop("frequency_enum", None)
+                context.user_data["reminder_time"] = reminder_time
+                await update.message.reply_text("Введите количество баллов за выполнение этой задачи (целое число):")
+                context.user_data["awaiting_points"] = True
                 return
             else:
                 await update.message.reply_text("⏰ Enter time in HH:MM format (e.g., 09:30) or press 'Skip'.")
                 return
+
+    async def points_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        db = SessionLocal()
+        try:
+            user = get_user_by_telegram_id(db, update.effective_user.id)
+            if not user:
+                await update.message.reply_text("Вы не зарегистрированы. Используйте /start.")
+                return
+            await update.message.reply_text(f"Ваши баллы: {user.user_points}")
+        finally:
+            db.close()
+
+if __name__ == "__main__":
+    from config import get_env_vars
+    env = get_env_vars()
+    token = env.TELEGRAM_BOT_TOKEN
+    db_url = env.DB_URL
+    TgBotClient(token, db_url).run()

@@ -24,12 +24,19 @@ def get_all_users(db: Session):
     return db.query(User).all()
 
 # 🟢 CREATE Task
-def create_task(db: Session, user_id: int, title: str, frequency: Frequency, days_of_week: str | None = None):
-    db_task = Task(user_id=user_id, title=title, frequency=frequency, days_of_week=days_of_week)
-    db.add(db_task)
+def create_task(db: Session, user_id: int, title: str, frequency: Frequency, days_of_week: str | None = None, reminder_time=None, points: int = 0):
+    task = Task(
+        user_id=user_id,
+        title=title,
+        frequency=frequency.value if hasattr(frequency, 'value') else frequency,
+        days_of_week=days_of_week,
+        reminder_time=reminder_time,
+        points=points
+    )
+    db.add(task)
     db.commit()
-    db.refresh(db_task)
-    return db_task
+    db.refresh(task)
+    return task
 
 # 🟢 GET Tasks by User
 def get_tasks_by_user(db: Session, user_id: int):
@@ -90,19 +97,19 @@ def get_tasks_due_today(db: Session, user_id: int):
 
 # 🟢 UPDATE Task (Mark as Completed)
 def complete_task(db: Session, task_id: int):
-    """Mark a task as completed by creating a completion record"""
+    """Mark a task as completed by creating a completion record and add points to user."""
     task = db.query(Task).filter(Task.id == task_id).first()
-    if task:
-        # Create a new completion record
+    if task and not task.completed:
         completion = TaskCompletion(
             task_id=task.id, 
             completed_at=datetime.utcnow()
         )
         db.add(completion)
-        
-        # Update the last_completed timestamp on the task itself
         task.last_completed = completion.completed_at
-        
+        # Добавить баллы пользователю
+        user = db.query(User).filter(User.id == task.user_id).first()
+        if user:
+            user.user_points = (user.user_points or 0) + (task.points or 0)
         db.commit()
         db.refresh(task)
     return task
