@@ -1,5 +1,5 @@
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackContext, ContextTypes, CallbackQueryHandler, JobQueue
+from telegram.ext import Application, CommandHandler, CallbackContext, ContextTypes, CallbackQueryHandler, JobQueue, MessageHandler, filters
 from sqlalchemy.orm import sessionmaker
 from loguru import logger
 from datetime import datetime, time, timedelta
@@ -8,6 +8,7 @@ from pytz import timezone
 import asyncio
 import sqlalchemy
 from sqlalchemy import exc  # Add explicit import for sqlalchemy.exc
+import re
 
 from database.database import engine, SessionLocal
 from services.crud import (
@@ -46,6 +47,7 @@ class TgBotClient:
         application.add_handler(CommandHandler("today_tasks", self.today_tasks_command))
         application.add_handler(CommandHandler("done", self.done_command))
         application.add_handler(CommandHandler("delete", self.delete_command))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_message_handler))
 
 
     async def post_init(self, application: Application) -> None:
@@ -75,15 +77,15 @@ class TgBotClient:
         # Schedule the daily reminder job
         job_queue = application.job_queue
         
-        # Set the time to specified Almaty time 
-        target_time = time(9, 0, 0, tzinfo=timezone('Asia/Almaty'))
+        # Set the time to specified Yekaterinburg time (UTC+5)
+        target_time = time(9, 0, 0, tzinfo=timezone('Asia/Yekaterinburg'))
         job_queue.run_daily(self.send_daily_reminders, target_time)
-        logger.info(f"Scheduled daily reminders for {target_time} (Almaty time)")
+        logger.info(f"Scheduled daily reminders for {target_time} (Yekaterinburg time)")
         
         # Schedule yearly cleanup on the first day of each month
-        first_day_midnight = time(0, 0, 0, tzinfo=timezone('Asia/Almaty'))
+        first_day_midnight = time(0, 0, 0, tzinfo=timezone('Asia/Yekaterinburg'))
         job_queue.run_monthly(self.yearly_cleanup_job, first_day_midnight, 1)
-        logger.info(f"Scheduled yearly cleanup on first day of each month at {first_day_midnight} (Almaty time)")
+        logger.info(f"Scheduled yearly cleanup on first day of each month at {first_day_midnight} (Yekaterinburg time)")
         
         # Schedule backup notifications every 6 hours
         job_queue.run_repeating(
@@ -92,6 +94,8 @@ class TgBotClient:
             first=timedelta(hours=6)
         )
         logger.info("Scheduled backup reminders every 6 hours")
+
+        await self.schedule_task_reminders(application)
 
     async def get_username_by_id(self, bot, user_id: int):
         try:
@@ -312,30 +316,65 @@ class TgBotClient:
                     frequency_enum = Frequency[frequency_str]
                 except KeyError:
                     logger.error(f"Invalid frequency string received: {frequency_str}")
-                    await query.edit_message_text("Произошла ошибка: неверная частота.")
-                    return # Exit early
+                    await query.edit_message_text("An error occurred: invalid frequency.")
+                    return
 
+                context.user_data["frequency_enum"] = frequency_enum
                 if frequency_enum == Frequency.SPECIFIC_DAYS:
                     # Show day selection keyboard
+                    selected_days = context.user_data.get("selected_days", set())
                     keyboard = self._build_day_selection_keyboard(selected_days)
                     reply_markup = InlineKeyboardMarkup(keyboard)
                     await query.edit_message_text(
-                        f"Задача: {task_name}\nВыберите дни недели (или снимите выбор). Нажмите Done когда закончите:",
+                        "Select the days for this task:",
                         reply_markup=reply_markup
                     )
+                    return
                 else:
-                    # Save task with selected frequency (ONCE, EVERYDAY, WEEKLY, MONTHLY)
-                    create_task(
-                        db=db,
-                        user_id=user.id,
-                        title=task_name,
-                        frequency=frequency_enum
-                        # days_of_week is omitted, defaults to None in DB
+                    # For all other frequencies, ask for reminder time
+                    await query.edit_message_text(
+                        "Enter reminder time for the task (e.g., 09:30) or press 'Skip':",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Skip", callback_data="skip_reminder_time")]])
                     )
-                    await query.edit_message_text(f"✅ Задача '{task_name}' с частотой '{frequency_str}' добавлена!")
-                    # Clean up user_data
-                    context.user_data.pop("task_name", None)
-                    context.user_data.pop("selected_days", None)
+                    return
+            elif callback_data == "day_done":
+                selected_days = context.user_data.get("selected_days", set())
+                if not selected_days:
+                    await query.answer("You didn't select any days!", show_alert=True)
+                    return
+                # Sort days according to DAYS_OF_WEEK order before joining
+                days_str = ",".join(sorted(list(selected_days), key=DAYS_OF_WEEK.index))
+                context.user_data["days_of_week"] = days_str
+                # After days are selected, ask for reminder time
+                await query.edit_message_text(
+                    "Enter reminder time for the task (e.g., 09:30) or press 'Skip':",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Skip", callback_data="skip_reminder_time")]])
+                )
+                return
+            elif callback_data == "skip_reminder_time":
+                frequency_enum = context.user_data.get("frequency_enum")
+                task_name = context.user_data.get("task_name")
+                days_of_week = context.user_data.get("days_of_week")
+                task = create_task(
+                    db=db,
+                    user_id=user.id,
+                    title=task_name,
+                    frequency=frequency_enum,
+                    days_of_week=days_of_week
+                )
+                logger.info(f"Task created: id={task.id}, user_id={user.id}, telegram_id={user.telegram_id}, reminder_time={task.reminder_time}")
+                if task.reminder_time:
+                    context.application.job_queue.run_daily(
+                        self._make_task_reminder_callback(user.telegram_id, task.id),
+                        time=task.reminder_time
+                    )
+                    logger.info(f"Scheduled reminder for task {task.id} at {task.reminder_time} (telegram_id={user.telegram_id})")
+                await query.edit_message_text(f"✅ Task '{task_name}' with frequency '{frequency_enum.name}' added without reminder time!")
+                context.user_data.pop("task_name", None)
+                context.user_data.pop("frequency_enum", None)
+                context.user_data.pop("selected_days", None)
+                context.user_data.pop("days_of_week", None)
+                return
 
             elif callback_data.startswith("day_select_"):
                 day = callback_data.split("_")[2]
@@ -354,26 +393,6 @@ class TgBotClient:
                 else:
                      logger.warning(f"Invalid day received in callback: {day}")
                      await query.answer("Ошибка: неверный день", show_alert=True) # Notify user
-
-            elif callback_data == "day_done":
-                if not selected_days:
-                    await query.answer("Вы не выбрали ни одного дня!", show_alert=True)
-                    # Don't close the message here, let the user select days or cancel implicitly
-                    return # Exit without saving
-
-                # Sort days according to DAYS_OF_WEEK order before joining
-                days_str = ",".join(sorted(list(selected_days), key=DAYS_OF_WEEK.index))
-                create_task(
-                    db=db,
-                    user_id=user.id,
-                    title=task_name,
-                    frequency=Frequency.SPECIFIC_DAYS,
-                    days_of_week=days_str
-                )
-                await query.edit_message_text(f"✅ Задача '{task_name}' добавлена для дней: {days_str}!")
-                # Clean up user_data
-                context.user_data.pop("task_name", None)
-                context.user_data.pop("selected_days", None)
 
         except Exception as e:
             logger.error(f"Error in handle_button_click: {e}")
@@ -407,9 +426,7 @@ class TgBotClient:
         buttons = []
         
         for task in tasks:
-            # Task ID will help identify which task to mark as completed
             task_id = task.id
-            
             freq_str = task.frequency.name
             if task.frequency == Frequency.SPECIFIC_DAYS and task.days_of_week:
                 freq_str = f"Specific ({task.days_of_week})"
@@ -417,11 +434,25 @@ class TgBotClient:
                 freq_str = "Specific (Дни не указаны?)"
                 logger.warning(f"Task {task.id} has SPECIFIC_DAYS frequency but no days_of_week set.")
 
+            # Универсальный парсинг reminder_time
+            reminder_str = ""
+            if task.reminder_time:
+                t = None
+                if isinstance(task.reminder_time, str):
+                    try:
+                        t = datetime.strptime(task.reminder_time, "%H:%M:%S.%f").time()
+                    except ValueError:
+                        try:
+                            t = datetime.strptime(task.reminder_time, "%H:%M:%S").time()
+                        except Exception:
+                            reminder_str = f"⏰ {task.reminder_time}"
+                    if t:
+                        reminder_str = f"⏰ {t.strftime('%H:%M')}"
+                else:
+                    reminder_str = f"⏰ {task.reminder_time.strftime('%H:%M')}"
             status = '✅' if task.completed else '❌'
             
-            # Only show completion button for incomplete tasks
             if with_buttons:
-                # For incomplete tasks, show complete button
                 if not task.completed:
                     button_row = []
                     complete_button = InlineKeyboardButton(f"✅ #{task_id}", callback_data=f"complete_{task_id}")
@@ -429,12 +460,12 @@ class TgBotClient:
                     button_row.append(complete_button)
                     button_row.append(delete_button)
                     buttons.append(button_row)
-                # For completed tasks, only show delete button
                 else:
                     delete_button = InlineKeyboardButton(f"🗑️ #{task_id}", callback_data=f"delete_{task_id}")
                     buttons.append([delete_button])
             
-            task_lines.append(f"🔹 #{task_id}: {task.title} ({freq_str}) {status}")
+            # Включаем reminder_str в строку задачи
+            task_lines.append(f"🔹 #{task_id}: {task.title} ({freq_str}) {reminder_str} {status}".strip())
         
         task_list = "\n".join(task_lines)
         message_text = f"{title_prefix}\n{task_list}"
@@ -456,14 +487,22 @@ class TgBotClient:
                 return
 
             user_tasks = get_tasks_by_user(db, user.id)
-            message_text, markup = await self._format_task_list(user_tasks, "📌 Ваши задачи:", with_buttons=True)
-            
-            # Send with buttons if there are any incomplete tasks
+            # Debug: log all tasks returned for this user
+            logger.info(f"[DEBUG] /list_task for user {user_id}: " + str([
+                {'id': t.id, 'title': t.title, 'frequency': str(t.frequency), 'reminder_time': str(t.reminder_time), 'completed': t.completed, 'user_id': t.user_id}
+                for t in user_tasks
+            ]))
+            # Sort: tasks with reminder_time first, then by reminder_time and ID
+            def sort_key(task):
+                return (task.reminder_time is None, str(task.reminder_time), task.id)
+            user_tasks_sorted = sorted(user_tasks, key=sort_key)
+            # Use the original formatter with buttons
+            message_text, markup = await self._format_task_list(user_tasks_sorted, "📌 Your tasks:", with_buttons=True)
             await update.message.reply_text(message_text, reply_markup=markup)
 
         except Exception as e:
-            logger.error(f"Ошибка при получении списка задач: {e}")
-            await update.message.reply_text("⚠️ Ошибка при получении списка задач.")
+            logger.error(f"Error while getting task list: {e}")
+            await update.message.reply_text("⚠️ Error while getting task list.")
         finally:
             db.close()
 
@@ -578,7 +617,7 @@ class TgBotClient:
         This runs every few hours to ensure users get their daily reminders
         even if the main job fails.
         """
-        today = datetime.now(timezone('Asia/Almaty')).date()
+        today = datetime.now(timezone('Asia/Yekaterinburg')).date()
         logger.info(f"Running backup reminder check for {today}...")
         
         db = SessionLocal()
@@ -592,11 +631,11 @@ class TgBotClient:
                 try:
                     # Check if user has been notified today
                     if user.last_notified:
-                        # Convert to Almaty timezone for comparison
-                        last_notified_almaty = user.last_notified.astimezone(timezone('Asia/Almaty'))
-                        if last_notified_almaty.date() == today:
+                        # Convert to Yekaterinburg timezone for comparison
+                        last_notified_yekaterinburg = user.last_notified.astimezone(timezone('Asia/Yekaterinburg'))
+                        if last_notified_yekaterinburg.date() == today:
                             # User already notified today, skip
-                            logger.info(f"User {user.telegram_id} already notified today at {last_notified_almaty}, skipping backup.")
+                            logger.info(f"User {user.telegram_id} already notified today at {last_notified_yekaterinburg}, skipping backup.")
                             continue
                     
                     # User hasn't been notified today, check for tasks and send reminder
@@ -752,7 +791,7 @@ class TgBotClient:
         This is scheduled to run monthly but only performs cleanup 
         on January 1st to avoid excessive DB operations.
         """
-        today = datetime.now(timezone('Asia/Almaty'))
+        today = datetime.now(timezone('Asia/Yekaterinburg'))
         
         # Only do cleanup on January 1st
         if today.month == 1 and today.day == 1:
@@ -778,6 +817,78 @@ class TgBotClient:
         else:
             logger.info(f"Monthly check for yearly cleanup - skipping (not January 1st)")
 
+    async def schedule_task_reminders(self, application: Application):
+        """Планирует напоминания для всех задач с reminder_time."""
+        db = SessionLocal()
+        try:
+            users = get_all_users(db)
+            for user in users:
+                tasks = get_tasks_by_user(db, user.id)
+                for task in tasks:
+                    if task.reminder_time:
+                        # Планируем напоминание для каждой задачи
+                        application.job_queue.run_daily(
+                            self._make_task_reminder_callback(user.telegram_id, task.id),
+                            time=task.reminder_time
+                        )
+        finally:
+            db.close()
+
+    def _make_task_reminder_callback(self, telegram_id, task_id):
+        async def callback(context: CallbackContext):
+            db = SessionLocal()
+            try:
+                task = db.query(Task).filter(Task.id == task_id).first()
+                if task and not task.completed:
+                    logger.info(f"Sending reminder for task {task.id} ({task.title}) at {task.reminder_time}")
+                    await context.bot.send_message(chat_id=telegram_id, text=f"⏰ Напоминание: задача '{task.title}' ждет выполнения!")
+            finally:
+                db.close()
+        return callback
+
     def run(self):
         logger.info("Starting bot")
         self._bot.run_polling()
+
+    async def text_message_handler(self, update: Update, context: CallbackContext) -> None:
+        if "frequency_enum" in context.user_data and "task_name" in context.user_data:
+            time_text = update.message.text.strip()
+            match = re.match(r"^(\d{1,2}):(\d{2})$", time_text)
+            if match:
+                hour, minute = int(match.group(1)), int(match.group(2))
+                reminder_time = time(hour, minute)
+                frequency_enum = context.user_data.get("frequency_enum")
+                task_name = context.user_data.get("task_name")
+                db = SessionLocal()
+                try:
+                    user = get_user_by_telegram_id(db, update.effective_user.id)
+                    if not user:
+                        await update.message.reply_text("You are not registered. Use /start.")
+                        return
+                    task = create_task(
+                        db=db,
+                        user_id=user.id,
+                        title=task_name,
+                        frequency=frequency_enum,
+                        reminder_time=reminder_time
+                    )
+                    logger.info(f"Task created: id={task.id}, user_id={user.id}, telegram_id={user.telegram_id}, reminder_time={task.reminder_time}")
+                    # Schedule reminder immediately
+                    try:
+                        tz_reminder_time = reminder_time.replace(tzinfo=timezone('Asia/Yekaterinburg'))
+                        context.application.job_queue.run_daily(
+                            self._make_task_reminder_callback(user.telegram_id, task.id),
+                            time=tz_reminder_time
+                        )
+                        logger.info(f"Scheduled reminder for task {task.id} at {tz_reminder_time} (telegram_id={user.telegram_id})")
+                    except Exception as e:
+                        logger.error(f"[REMINDER_SCHEDULE_ERROR] Failed to schedule reminder for task {task.id}: {e}")
+                    await update.message.reply_text(f"✅ Task '{task_name}' with reminder at {reminder_time.strftime('%H:%M')} added!")
+                finally:
+                    db.close()
+                context.user_data.pop("task_name", None)
+                context.user_data.pop("frequency_enum", None)
+                return
+            else:
+                await update.message.reply_text("⏰ Enter time in HH:MM format (e.g., 09:30) or press 'Skip'.")
+                return
